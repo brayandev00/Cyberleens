@@ -1,0 +1,10 @@
+{
+  "name": "abspider-recon",
+  "private": true,
+  "scripts": {
+    "dev": "pnpm -r --parallel run dev",
+    "start": "pnpm -r run start",
+    "build": "pnpm -r run build",
+    "clean": "pnpm -r exec rm -rf node_modules && rm -rf node_modules"
+  }
+}
