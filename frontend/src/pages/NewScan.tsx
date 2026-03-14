@@ -1,89 +1,1065 @@
-// Dummy check for NewScan
-import { useState } from "react";
-import { useNavigate } from "react-router-dom";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { Search, Globe, Shield, Zap } from "lucide-react";
-import { toast } from "sonner";
-import { useAuth } from "@/contexts/AuthContext";
+import { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { cn } from '@/lib/utils';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { Checkbox } from '@/components/ui/checkbox';
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
+import { Globe, Network, AlertTriangle, Code, TrendingUp, Settings2, Loader2, Zap, CheckSquare, Square, CalendarDays, AlertCircle, Shield } from 'lucide-react';
+import { useToast } from '@/hooks/use-toast';
+import { startScan, ScanConfig } from '@/services/scanService'; // Import ScanConfig
+import { useForm } from 'react-hook-form';
+import { zodResolver } from '@hookform/resolvers/zod';
+import * as z from 'zod';
+import { isInternalIP, extractHostname } from '@/services/apiUtils';
+import { addScheduledScan } from '@/services/scheduledScanService';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { format } from 'date-fns';
+import SQL_PAYLOADS_JSON from '@/payloads/sqli.json';
+import XSS_PAYLOADS_JSON from '@/payloads/xss.json';
+import LFI_PAYLOADS_JSON from '@/payloads/lfi.json';
+import ScanHeader from '@/components/ScanHeader';
+import { createSmartScanManager } from '@/services/smartScanService';
+// Removed import of PayloadCountDisplay
+
+// Define the maximum available payloads based on service files
+const MAX_SQLI_PAYLOADS = SQL_PAYLOADS_JSON.length;
+const MAX_XSS_PAYLOADS = XSS_PAYLOADS_JSON.length;
+const MAX_LFI_PAYLOADS = LFI_PAYLOADS_JSON.length;
+
+// Define validation schema with Zod
+const scanFormSchema = z.object({
+  target: z.string().min(1, { message: "La URL objetivo o dirección IP es obligatoria." })
+    .refine(val => {
+      try {
+        new URL(val.startsWith('http') ? val : `https://${val}`);
+        return true;
+      } catch {
+        return false;
+      }
+    }, { message: "Formato de URL o dirección IP inválido." }),
+  scanName: z.string().optional(),
+  siteInfo: z.boolean(),
+  headers: z.boolean(),
+  whois: z.boolean(),
+  geoip: z.boolean(),
+  dns: z.boolean(),
+  mx: z.boolean(),
+  subnet: z.boolean(),
+  ports: z.boolean(),
+  subdomains: z.boolean(),
+  reverseip: z.boolean(),
+  sqlinjection: z.boolean(),
+  xss: z.boolean(),
+  lfi: z.boolean(),
+  wordpress: z.boolean(),
+  seo: z.boolean(),
+  ddosFirewall: z.boolean(),
+  virustotal: z.boolean(),
+  sslTls: z.boolean(),
+  techStack: z.boolean(),
+  brokenLinks: z.boolean(),
+  corsMisconfig: z.boolean(),
+  xssPayloads: z.number().min(1).max(MAX_XSS_PAYLOADS).default(20),
+  sqliPayloads: z.number().min(1).max(MAX_SQLI_PAYLOADS).default(20),
+  lfiPayloads: z.number().min(1).max(MAX_LFI_PAYLOADS).default(20),
+  ddosRequests: z.number().min(1).max(100).default(20),
+  useProxy: z.boolean(),
+  threads: z.number().min(1).max(50),
+  smartScanEnabled: z.boolean().default(false),
+  smartScanMode: z.enum(['conservative', 'adaptive', 'aggressive']).default('adaptive'),
+  
+  // Scheduling fields
+  scheduleScan: z.boolean().default(false),
+  scheduleFrequency: z.enum(['once', 'daily', 'weekly', 'monthly']).optional(),
+  scheduleStartDate: z.string().optional(),
+  scheduleStartTime: z.string().optional(),
+}).superRefine((data, ctx) => {
+  if (data.scheduleScan) {
+    if (!data.scanName || data.scanName.trim() === '') {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "El escaneo programado requiere un nombre.",
+        path: ['scanName'],
+      });
+    }
+    if (!data.scheduleFrequency) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "La frecuencia es obligatoria para los escaneos programados.",
+        path: ['scheduleFrequency'],
+      });
+    }
+    if (!data.scheduleStartDate) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "La fecha de inicio es obligatoria para escaneos programados.",
+        path: ['scheduleStartDate'],
+      });
+    }
+    if (!data.scheduleStartTime) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "La hora de inicio es obligatoria para escaneos programados.",
+        path: ['scheduleStartTime'],
+      });
+    }
+  }
+});
+
+type ScanFormValues = z.infer<typeof scanFormSchema>;
 
 const NewScan = () => {
-  const [url, setUrl] = useState("");
-  const [loading, setLoading] = useState(false);
   const navigate = useNavigate();
-  const { user } = useAuth();
+  const { toast } = useToast();
+  const [isScanning, setIsScanning] = useState(false);
+  
+  const form = useForm<ScanFormValues>({
+    resolver: zodResolver(scanFormSchema),
+    defaultValues: {
+      target: '',
+      scanName: '',
+      siteInfo: true,
+      headers: true,
+      whois: true,
+      geoip: true,
+      dns: true,
+      mx: true,
+      subnet: false,
+      ports: false,
+      subdomains: true,
+      reverseip: false,
+      sqlinjection: false,
+      xss: false,
+      lfi: false,
+      wordpress: false,
+      seo: true,
+      ddosFirewall: false,
+      virustotal: false,
+      sslTls: false,
+      techStack: false,
+      brokenLinks: false,
+      corsMisconfig: false,
+      xssPayloads: 20,
+      sqliPayloads: 20,
+      lfiPayloads: 20,
+      ddosRequests: 20,
+      useProxy: false,
+      threads: 20,
+      smartScanEnabled: false,
+      smartScanMode: 'adaptive',
+      scheduleScan: false,
+      scheduleFrequency: 'daily',
+      scheduleStartDate: format(new Date(), 'yyyy-MM-dd'),
+      scheduleStartTime: format(new Date(), 'HH:mm'),
+    },
+  });
 
-  const handleStartScan = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!url) return toast.error("Por favor ingresa una URL");
+  const { watch, setValue, handleSubmit, formState: { errors } } = form;
+  const formData = watch();
+
+  // Count selected modules for header display
+  const selectedModules = Object.values(formData).filter(value => 
+    typeof value === 'boolean' && value === true
+  ).length;
+  // Dynamic calculation for non-boolean or complex fields that might be considered modules
+  const totalModules = 20; // Fixed count of available scan modules
+
+  const handleSaveTemplate = () => {
+    const template = {
+      name: formData.scanName || `Template-${Date.now()}`,
+      config: formData,
+      createdAt: new Date().toISOString()
+    };
     
-    setLoading(true);
-    try {
-      // Logic for starting scan would go here
-      // For now just redirect
-      navigate("/scans");
-      toast.info("Escaneo iniciado correctamente");
-    } catch (error: any) {
-      toast.error(error.message);
-    } finally {
-      setLoading(false);
+    const savedTemplates = JSON.parse(localStorage.getItem('scan-templates') || '[]');
+    savedTemplates.push(template);
+    localStorage.setItem('scan-templates', JSON.stringify(savedTemplates));
+    toast({ title: "Plantilla Guardada", description: "Tus configuraciones actuales se han guardado." });
+  };
+
+  const handleLoadTemplate = () => {
+    const savedTemplates = JSON.parse(localStorage.getItem('scan-templates') || '[]');
+    if (savedTemplates.length > 0) {
+      const latestTemplate = savedTemplates[savedTemplates.length - 1];
+      Object.keys(latestTemplate.config).forEach(key => {
+        setValue(key as keyof ScanFormValues, latestTemplate.config[key]);
+      });
+       toast({ title: "Plantilla Cargada", description: "Se han aplicado las configuraciones de la última plantilla." });
+    } else {
+        toast({ title: "Sin Plantillas", description: "No se encontraron plantillas guardadas.", variant: "destructive" });
     }
   };
 
+  const handleSmartScan = async (mode: 'adaptive' | 'conservative' | 'aggressive') => {
+    if (!formData.target) {
+        toast({ title: "Objetivo Requerido", description: "Ingresa una URL antes de usar el escaneo inteligente.", variant: "destructive" });
+        return;
+    }
+    
+    try {
+      // Create smart scan manager for target analysis
+      const smartManager = createSmartScanManager(formData.target, mode);
+      
+      // Get recommended payload counts based on target analysis
+      const { canProceed, recommendations } = await smartManager.performInitialRecon();
+      
+      if (!canProceed) {
+        toast({
+          title: "Fallo en el Escaneo Inteligente",
+          description: "El objetivo es inalcanzable o bloquea solicitudes.",
+          variant: "destructive",
+        });
+        return;
+      }
+
+      // Show recommendations to user
+      if (recommendations.length > 0) {
+        toast({
+          title: "Análisis del Escaneo Inteligente",
+          description: recommendations.join('. '),
+        });
+      }
+
+      // Set smart scan configuration based on mode
+      const smartConfigs = {
+        conservative: {
+          // Minimal modules for stealth
+          siteInfo: true,
+          headers: true,
+          whois: true,
+          geoip: true,
+          // Conservative mode with minimal payloads
+          sqlinjection: true,
+          xss: true,
+          sqliPayloads: 3,
+          xssPayloads: 2,
+          lfiPayloads: 2,
+          ddosRequests: 5,
+          smartScanEnabled: true
+        },
+        adaptive: {
+          // Balanced approach with AI-powered adjustment
+          siteInfo: true,
+          headers: true,
+          whois: true,
+          geoip: true,
+          dns: true,
+          mx: true,
+          sqlinjection: true,
+          xss: true,
+          lfi: true,
+          virustotal: true,
+          // Adaptive mode with balanced payloads
+          sqliPayloads: Math.floor(MAX_SQLI_PAYLOADS * 0.3),
+          xssPayloads: Math.floor(MAX_XSS_PAYLOADS * 0.3),
+          lfiPayloads: Math.floor(MAX_LFI_PAYLOADS * 0.3),
+          ddosRequests: 15,
+          smartScanEnabled: true
+        },
+        aggressive: {
+          // Maximum coverage but still respecting target limits
+          siteInfo: true,
+          headers: true,
+          whois: true,
+          geoip: true,
+          dns: true,
+          mx: true,
+          subnet: true,
+          ports: true,
+          sqlinjection: true,
+          xss: true,
+          lfi: true,
+          virustotal: true,
+          corsMisconfig: true,
+          wordpress: true,
+          seo: true,
+          brokenLinks: true,
+          ddosFirewall: true,
+          sslTls: true,
+          // Aggressive mode with maximum payloads
+          sqliPayloads: Math.floor(MAX_SQLI_PAYLOADS * 0.8),
+          xssPayloads: Math.floor(MAX_XSS_PAYLOADS * 0.8),
+          lfiPayloads: Math.floor(MAX_LFI_PAYLOADS * 0.8),
+          ddosRequests: 50,
+          smartScanEnabled: true
+        }
+      };
+
+      const config = smartConfigs[mode];
+      
+      // Apply configuration
+      Object.keys(config).forEach(key => {
+        setValue(key as keyof ScanFormValues, config[key as keyof typeof config]);
+      });
+      
+      // Set smart scan mode
+      setValue('smartScanMode', mode);
+      
+      // Submit the form with smart scan configuration
+      const updatedFormData = { ...formData, ...config, smartScanMode: mode };
+      handleSubmit(() => onSubmit(updatedFormData as ScanFormValues))();
+      
+    } catch (error: any) {
+      toast({
+        title: "Error de Escaneo Inteligente",
+        description: error.message || "No se pudo analizar el objetivo para el escaneo inteligente.",
+        variant: "destructive",
+      });
+    }
+  };
+
+  const onSubmit = async (data: ScanFormValues) => {
+    setIsScanning(true);
+    try {
+      if (data.scheduleScan) {
+        if (!data.scanName || !data.scheduleFrequency || !data.scheduleStartDate || !data.scheduleStartTime) {
+          throw new Error("Faltan detalles de programación.");
+        }
+        const { scanName, scheduleFrequency, scheduleStartDate, scheduleStartTime, scheduleScan, smartScanMode, ...scanConfig } = data;
+        
+        addScheduledScan(scanName, scanConfig as ScanConfig, {
+          frequency: scheduleFrequency,
+          startDate: scheduleStartDate,
+          startTime: scheduleStartTime,
+        });
+        toast({
+          title: "Escaneo Programado",
+          description: `El escaneo '${scanName}' ha sido programado para ejecutarse ${scheduleFrequency}.`,
+        });
+        navigate('/dashboard');
+      } else {
+        const { smartScanMode, ...scanConfig } = data;
+        const scanId = await startScan(scanConfig as ScanConfig);
+        toast({
+          title: "Escaneo Iniciado",
+          description: `Analizando ${data.target}...`,
+        });
+        navigate(`/scan/${scanId}`);
+      }
+    } catch (error: any) {
+      toast({
+        title: "Error al Procesar Escaneo",
+        description: error.message || "Ha ocurrido un error inesperado.",
+        variant: "destructive",
+      });
+      setIsScanning(false);
+    }
+  };
+
+  const toggleBasicScans = () => {
+    const allChecked = formData.siteInfo && formData.headers && formData.techStack;
+    setValue('siteInfo', !allChecked);
+    setValue('headers', !allChecked);
+    setValue('techStack', !allChecked);
+  };
+
+  const toggleNetworkIntelligence = () => {
+    const allChecked = formData.whois && formData.geoip && formData.dns && formData.mx && formData.subnet && formData.ports && formData.subdomains && formData.reverseip;
+    setValue('whois', !allChecked);
+    setValue('geoip', !allChecked);
+    setValue('dns', !allChecked);
+    setValue('mx', !allChecked);
+    setValue('subnet', !allChecked);
+    setValue('ports', !allChecked);
+    setValue('subdomains', !allChecked);
+    setValue('reverseip', !allChecked);
+  };
+
+  const toggleVulnerabilityAssessment = () => {
+    const allChecked = formData.sqlinjection && formData.xss && formData.lfi && formData.virustotal && formData.corsMisconfig;
+    setValue('sqlinjection', !allChecked);
+    setValue('xss', !allChecked);
+    setValue('lfi', !allChecked);
+    setValue('virustotal', !allChecked);
+    setValue('corsMisconfig', !allChecked);
+  };
+
+  const toggleCmsDetection = () => {
+    const allChecked = formData.wordpress;
+    setValue('wordpress', !allChecked);
+  };
+
+  const toggleSeoAnalytics = () => {
+    const allChecked = formData.seo && formData.brokenLinks;
+    setValue('seo', !allChecked);
+    setValue('brokenLinks', !allChecked);
+  };
+
+  const toggleSecurityTesting = () => {
+    const allChecked = formData.ddosFirewall && formData.sslTls;
+    setValue('ddosFirewall', !allChecked);
+    setValue('sslTls', !allChecked);
+  };
+
+  const allBasicChecked = formData.siteInfo && formData.headers && formData.techStack;
+  const anyBasicChecked = formData.siteInfo || formData.headers || formData.techStack;
+
+  const allNetworkChecked = formData.whois && formData.geoip && formData.dns && formData.mx && formData.subnet && formData.ports && formData.subdomains && formData.reverseip;
+  const anyNetworkChecked = formData.whois || formData.geoip || formData.dns || formData.mx || formData.subnet || formData.ports || formData.subdomains || formData.reverseip;
+
+  const allVulnChecked = formData.sqlinjection && formData.xss && formData.lfi && formData.virustotal && formData.corsMisconfig;
+  const anyVulnChecked = formData.sqlinjection || formData.xss || formData.lfi || formData.virustotal || formData.corsMisconfig;
+
+  const allCmsChecked = formData.wordpress;
+  const anyCmsChecked = formData.wordpress;
+
+  const allSeoChecked = formData.seo && formData.brokenLinks;
+  const anySeoChecked = formData.seo || formData.brokenLinks;
+
+  const allSecurityChecked = formData.ddosFirewall && formData.sslTls;
+  const anySecurityChecked = formData.ddosFirewall || formData.sslTls;
+
+  const targetHostname = formData.target ? extractHostname(formData.target) : '';
+  const isTargetInternal = targetHostname && (isInternalIP(targetHostname) || targetHostname === 'localhost');
+
   return (
-    <div className="max-w-4xl mx-auto space-y-8">
-      <div className="text-center space-y-4">
-        <h1 className="text-4xl font-bold tracking-tight text-white italic">
-          Nueva <span className="text-cyan-500">Auditoría</span>
-        </h1>
-        <p className="text-slate-400 text-lg max-w-2xl mx-auto">
-          Ingresa la URL del objetivo para comenzar el análisis de seguridad profundo.
-        </p>
-      </div>
-
-      <Card className="bg-slate-900/50 border-slate-800 backdrop-blur-sm overflow-hidden border-t-2 border-t-cyan-500/50">
-        <CardHeader className="pb-4">
-          <CardTitle>Configuración del Objetivo</CardTitle>
-          <CardDescription>Análisis automatizado de vulnerabilidades y reconocimiento.</CardDescription>
-        </CardHeader>
-        <CardContent>
-          <form onSubmit={handleStartScan} className="space-y-6">
-            <div className="relative group">
-              <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
-                <Globe className="h-5 w-5 text-slate-500 group-focus-within:text-cyan-500 transition-colors" />
-              </div>
-              <Input
-                placeholder="https://ejemplo.com"
-                className="pl-12 h-14 bg-slate-950/50 border-slate-800 text-lg focus-visible:ring-cyan-500/50 focus-visible:ring-offset-0"
-                value={url}
-                onChange={(e) => setUrl(e.target.value)}
-              />
-            </div>
-            
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-              {[
-                { icon: Search, label: "Reconocimiento", desc: "Subdominios, Whois, DNS" },
-                { icon: Shield, label: "Vulnerabilidades", desc: "SQLi, XSS, LFI, CORS" },
-                { icon: Zap, label: "Performance", desc: "SEO, Headers, SSL" },
-              ].map((item, idx) => (
-                <div key={idx} className="p-4 rounded-xl bg-slate-950/50 border border-slate-800 flex flex-col items-center text-center space-y-2">
-                  <div className="p-2 rounded-lg bg-cyan-500/10 text-cyan-500 mb-1">
-                    <item.icon className="h-5 w-5" />
+    <div className="flex flex-col h-full w-full">
+      <ScanHeader
+        isScanning={isScanning}
+        onSave={handleSaveTemplate}
+        onLoad={handleLoadTemplate}
+        onSmartScan={handleSmartScan}
+        selectedModules={selectedModules}
+        totalModules={totalModules}
+        smartScanMode={formData.smartScanMode || 'adaptive'}
+        onSmartScanModeChange={(mode) => setValue('smartScanMode', mode)}
+      />
+      
+      <main className="flex-1 overflow-auto p-6 bg-background dark:bg-gradient-to-br dark:from-slate-950 dark:via-slate-900 dark:to-slate-950">
+        <div className="max-w-5xl mx-auto space-y-6">
+          <form onSubmit={handleSubmit(onSubmit)} className="space-y-6">
+            {/* Target Input */}
+            <Card className="group relative overflow-hidden bg-gradient-to-br from-blue-500/5 via-blue-500/10 to-cyan-500/5 backdrop-blur-sm border-0 shadow-lg hover:shadow-2xl transition-all duration-500 hover:-translate-y-1">
+              <div className="absolute inset-0 bg-gradient-to-br from-blue-500/10 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-500" />
+              <CardHeader className="relative z-10">
+                <CardTitle className="flex items-center gap-3 text-slate-900 dark:text-slate-100">
+                  <div className="p-2 bg-blue-500/20 rounded-lg group-hover:scale-110 transition-transform duration-300">
+                    <Globe className="h-5 w-5 text-blue-600 dark:text-blue-400" />
                   </div>
-                  <h3 className="font-medium text-slate-200">{item.label}</h3>
-                  <p className="text-xs text-slate-500">{item.desc}</p>
+                  <span className="font-semibold">Configuración del Objetivo</span>
+                </CardTitle>
+                <CardDescription>
+                  Ingresa la URL o dirección IP a escanear
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="relative z-10">
+                <div className="space-y-2">
+                  <Label htmlFor="target">URL Objetivo o Dirección IP</Label>
+                  <Input
+                    id="target"
+                    type="text"
+                    placeholder="ejemplo.com o 192.168.1.1"
+                    value={formData.target || ''}
+                    onChange={(e) => setValue('target', e.target.value)}
+                    className={cn("text-base bg-muted/30 border-border focus:border-primary focus:ring-primary", errors.target && "border-destructive focus:border-destructive focus:ring-destructive")}
+                  />
+                  {errors.target && (
+                    <p className="text-sm text-destructive flex items-center gap-1">
+                      <AlertTriangle className="h-4 w-4" /> {errors.target.message}
+                    </p>
+                  )}
+                  {isTargetInternal && (
+                    <Alert className="border-yellow-500/50 bg-yellow-500/10">
+                      <AlertTriangle className="h-4 w-4 text-yellow-600 dark:text-yellow-500" />
+                      <AlertTitle className="text-yellow-600 dark:text-yellow-400 font-bold">
+                        ADVERTENCIA: Objetivo Interno Detectado
+                      </AlertTitle>
+                      <AlertDescription className="text-sm mt-2 text-yellow-600 dark:text-yellow-300">
+                        Estás intentando escanear una IP interna o localhost.
+                        Asegúrate de tener autorización explícita antes de escanear redes internas.
+                        El escaneo no autorizado puede ser ilegal.
+                      </AlertDescription>
+                    </Alert>
+                  )}
                 </div>
-              ))}
-            </div>
+              </CardContent>
+            </Card>
 
-            <Button type="submit" className="w-full h-14 text-lg font-bold bg-cyan-600 hover:bg-cyan-700 shadow-xl shadow-cyan-900/20" disabled={loading}>
-              {loading ? "Preparando motor de escaneo..." : "Lanzar Auditoría Completa"}
-            </Button>
+            {/* Schedule Scan Feature */}
+            <Card className={cn(
+              "group relative overflow-hidden backdrop-blur-sm border-0 shadow-lg hover:shadow-2xl transition-all duration-500 hover:-translate-y-1",
+              formData.scheduleScan 
+                ? "bg-gradient-to-br from-purple-500/10 via-violet-500/15 to-purple-500/10" 
+                : "bg-gradient-to-br from-purple-500/5 via-violet-500/10 to-purple-500/5"
+            )}>
+              <div className={cn(
+                "absolute inset-0 bg-gradient-to-br from-purple-500/10 to-transparent transition-opacity duration-500",
+                formData.scheduleScan ? "opacity-100" : "opacity-0 group-hover:opacity-100"
+              )} />
+              <CardHeader className="flex flex-row items-center justify-between relative z-10">
+                <CardTitle className="flex items-center gap-3 text-slate-900 dark:text-slate-100">
+                  <div className="p-2 bg-purple-500/20 rounded-lg group-hover:scale-110 transition-transform duration-300">
+                    <CalendarDays className="h-5 w-5 text-purple-600 dark:text-purple-400" />
+                  </div>
+                  <span className="font-semibold">Programar Escaneo</span>
+                </CardTitle>
+                <div className="flex items-center space-x-2">
+                  <Label htmlFor="scheduleScan" className="text-sm text-muted-foreground">Activar Programación</Label>
+                  <Checkbox
+                    id="scheduleScan"
+                    checked={formData.scheduleScan}
+                    onCheckedChange={(checked) => setValue('scheduleScan', checked as boolean)}
+                  />
+                </div>
+              </CardHeader>
+              {formData.scheduleScan && (
+                <CardContent className="space-y-4 relative z-10">
+                  <Alert className="border-blue-500/50 bg-blue-500/10">
+                    <AlertCircle className="h-4 w-4 text-blue-600 dark:text-blue-500" />
+                    <AlertTitle className="text-blue-600 dark:text-blue-400 font-bold">
+                      Programación del Lado del Cliente
+                    </AlertTitle>
+                    <AlertDescription className="text-sm mt-2 text-blue-600 dark:text-blue-300">
+                      Los escaneos programados solo se ejecutarán cuando esta aplicación esté abierta en tu navegador.
+                      Asegúrate de que la pestaña permanezca activa para que los escaneos se ejecuten según el plan.
+                    </AlertDescription>
+                  </Alert>
+                  <div className="space-y-2">
+                    <Label htmlFor="scanName">Nombre del Escaneo Programado</Label>
+                    <Input
+                      id="scanName"
+                      type="text"
+                      placeholder="Revisión Diaria de Mi Sitio Web"
+                      value={formData.scanName || ''}
+                      onChange={(e) => setValue('scanName', e.target.value)}
+                      className={cn("bg-muted/30 border-border focus:border-primary focus:ring-primary", errors.scanName && "border-destructive focus:border-destructive focus:ring-destructive")}
+                    />
+                    {errors.scanName && (
+                      <p className="text-sm text-destructive flex items-center gap-1">
+                        <AlertTriangle className="h-4 w-4" /> {errors.scanName.message}
+                      </p>
+                    )}
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                    <div className="space-y-2">
+                      <Label htmlFor="scheduleFrequency">Frecuencia</Label>
+                      <Select
+                        onValueChange={(value) => setValue('scheduleFrequency', value as 'once' | 'daily' | 'weekly' | 'monthly')}
+                        value={formData.scheduleFrequency}
+                      >
+                        <SelectTrigger className={cn("bg-muted/30 border-border focus:ring-primary", errors.scheduleFrequency && "border-destructive focus:border-destructive focus:ring-destructive")}>
+                          <SelectValue placeholder="Seleccionar frecuencia" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="once">Una vez</SelectItem>
+                          <SelectItem value="daily">Diariamente</SelectItem>
+                          <SelectItem value="weekly">Semanalmente</SelectItem>
+                          <SelectItem value="monthly">Mensualmente</SelectItem>
+                        </SelectContent>
+                      </Select>
+                      {errors.scheduleFrequency && (
+                        <p className="text-sm text-destructive flex items-center gap-1">
+                          <AlertTriangle className="h-4 w-4" /> {errors.scheduleFrequency.message}
+                        </p>
+                      )}
+                    </div>
+                    <div className="space-y-2">
+                      <Label htmlFor="scheduleStartDate">Fecha de Inicio</Label>
+                      <Input
+                        id="scheduleStartDate"
+                        type="date"
+                        value={formData.scheduleStartDate || ''}
+                        onChange={(e) => setValue('scheduleStartDate', e.target.value)}
+                        className={cn("bg-muted/30 border-border focus:border-primary focus:ring-primary", errors.scheduleStartDate && "border-destructive focus:border-destructive focus:ring-destructive")}
+                      />
+                      {errors.scheduleStartDate && (
+                        <p className="text-sm text-destructive flex items-center gap-1">
+                          <AlertTriangle className="h-4 w-4" /> {errors.scheduleStartDate.message}
+                        </p>
+                      )}
+                    </div>
+                    <div className="space-y-2">
+                      <Label htmlFor="scheduleStartTime">Hora de Inicio</Label>
+                      <Input
+                        id="scheduleStartTime"
+                        type="time"
+                        value={formData.scheduleStartTime || ''}
+                        onChange={(e) => setValue('scheduleStartTime', e.target.value)}
+                        className={cn("bg-muted/30 border-border focus:border-primary focus:ring-primary", errors.scheduleStartTime && "border-destructive focus:border-destructive focus:ring-destructive")}
+                      />
+                      {errors.scheduleStartTime && (
+                        <p className="text-sm text-destructive flex items-center gap-1">
+                          <AlertTriangle className="h-4 w-4" /> {errors.scheduleStartTime.message}
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                </CardContent>
+              )}
+            </Card>
+
+            {/* Basic Scans */}
+            <Card className={cn(
+              "group relative overflow-hidden backdrop-blur-sm border-0 shadow-lg hover:shadow-2xl transition-all duration-500 hover:-translate-y-1",
+              anyBasicChecked 
+                ? "bg-gradient-to-br from-blue-500/10 via-blue-500/15 to-cyan-500/10" 
+                : "bg-gradient-to-br from-blue-500/5 via-blue-500/10 to-cyan-500/5"
+            )}>
+              <div className={cn(
+                "absolute inset-0 bg-gradient-to-br from-blue-500/10 to-transparent transition-opacity duration-500",
+                anyBasicChecked ? "opacity-100" : "opacity-0 group-hover:opacity-100"
+              )} />
+              <CardHeader className="flex flex-row items-center justify-between relative z-10">
+                <CardTitle className="flex items-center gap-3 text-slate-900 dark:text-slate-100">
+                  <div className="p-2 bg-blue-500/20 rounded-lg group-hover:scale-110 transition-transform duration-300">
+                    <Shield className="h-5 w-5 text-blue-600 dark:text-blue-400" />
+                  </div>
+                  <span className="font-semibold">Reconocimiento Básico</span>
+                </CardTitle>
+                <Button type="button" variant="outline" size="sm" onClick={toggleBasicScans} className="bg-blue-50/50 dark:bg-blue-900/20 border-blue-200/50 dark:border-blue-700/30 text-blue-700 dark:text-blue-300 hover:bg-blue-100/70 dark:hover:bg-blue-800/30">
+                  {allBasicChecked ? <><Square className="h-4 w-4 mr-2" /> Deseleccionar Todo</> : <><CheckSquare className="h-4 w-4 mr-2" /> Seleccionar Todo</>}
+                </Button>
+              </CardHeader>
+              <CardContent className="relative z-10">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                  <div className="flex items-center space-x-2">
+                    <Checkbox
+                      id="siteInfo"
+                      checked={formData.siteInfo}
+                      onCheckedChange={(checked) => setValue('siteInfo', checked as boolean)}
+                    />
+                    <label htmlFor="siteInfo" className="text-sm text-foreground cursor-pointer">
+                      <span className="font-medium">Información del Sitio</span> - Detalles básicos del sitio
+                    </label>
+                  </div>
+                  <div className="flex items-center space-x-2">
+                    <Checkbox
+                      id="headers"
+                      checked={formData.headers}
+                      onCheckedChange={(checked) => setValue('headers', checked as boolean)}
+                    />
+                    <label htmlFor="headers" className="text-sm text-foreground cursor-pointer">
+                      <span className="font-medium">Cabeceras HTTP</span> - Cabeceras de respuesta del servidor
+                    </label>
+                  </div>
+                  <div className="flex items-center space-x-2">
+                    <Checkbox
+                      id="techStack"
+                      checked={formData.techStack}
+                      onCheckedChange={(checked) => setValue('techStack', checked as boolean)}
+                    />
+                    <label htmlFor="techStack" className="text-sm text-foreground cursor-pointer">
+                      <span className="font-medium">Análisis de Tecnologías (Tech Stack)</span> - Identificar tecnologías web
+                    </label>
+                  </div>
+                </div>
+              </CardContent>
+            </Card>
+
+            {/* Network & Domain Intelligence */}
+            <Card className={cn(
+              "group relative overflow-hidden backdrop-blur-sm border-0 shadow-lg hover:shadow-2xl transition-all duration-500 hover:-translate-y-1",
+              anyNetworkChecked 
+                ? "bg-gradient-to-br from-emerald-500/10 via-green-500/15 to-emerald-500/10" 
+                : "bg-gradient-to-br from-emerald-500/5 via-green-500/10 to-emerald-500/5"
+            )}>
+              <div className={cn(
+                "absolute inset-0 bg-gradient-to-br from-emerald-500/10 to-transparent transition-opacity duration-500",
+                anyNetworkChecked ? "opacity-100" : "opacity-0 group-hover:opacity-100"
+              )} />
+              <CardHeader className="flex flex-row items-center justify-between relative z-10">
+                <CardTitle className="flex items-center gap-3 text-slate-900 dark:text-slate-100">
+                  <div className="p-2 bg-emerald-500/20 rounded-lg group-hover:scale-110 transition-transform duration-300">
+                    <Network className="h-5 w-5 text-emerald-600 dark:text-emerald-400" />
+                  </div>
+                  <span className="font-semibold">Inteligencia de Red y Dominio</span>
+                </CardTitle>
+                <Button type="button" variant="outline" size="sm" onClick={toggleNetworkIntelligence} className="bg-emerald-50/50 dark:bg-emerald-900/20 border-emerald-200/50 dark:border-emerald-700/30 text-emerald-700 dark:text-emerald-300 hover:bg-emerald-100/70 dark:hover:bg-emerald-800/30">
+                  {allNetworkChecked ? <><Square className="h-4 w-4 mr-2" /> Deseleccionar Todo</> : <><CheckSquare className="h-4 w-4 mr-2" /> Seleccionar Todo</>}
+                </Button>
+              </CardHeader>
+              <CardContent className="relative z-10">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                  <div className="flex items-center space-x-2">
+                    <Checkbox
+                      id="whois"
+                      checked={formData.whois}
+                      onCheckedChange={(checked) => setValue('whois', checked as boolean)}
+                    />
+                    <label htmlFor="whois" className="text-sm text-foreground cursor-pointer">
+                      <span className="font-medium">Búsqueda WHOIS</span> - Información de registro del dominio
+                    </label>
+                  </div>
+                  <div className="flex items-center space-x-2">
+                    <Checkbox
+                      id="geoip"
+                      checked={formData.geoip}
+                      onCheckedChange={(checked) => setValue('geoip', checked as boolean)}
+                    />
+                    <label htmlFor="geoip" className="text-sm text-foreground cursor-pointer">
+                      <span className="font-medium">Ubicación GeoIP</span> - Ubicación física del servidor
+                    </label>
+                  </div>
+                  <div className="flex items-center space-x-2">
+                    <Checkbox
+                      id="dns"
+                      checked={formData.dns}
+                      onCheckedChange={(checked) => setValue('dns', checked as boolean)}
+                    />
+                    <label htmlFor="dns" className="text-sm text-foreground cursor-pointer">
+                      <span className="font-medium">Registros DNS</span> - Registros A, AAAA, CNAME, TXT
+                    </label>
+                  </div>
+                  <div className="flex items-center space-x-2">
+                    <Checkbox
+                      id="mx"
+                      checked={formData.mx}
+                      onCheckedChange={(checked) => setValue('mx', checked as boolean)}
+                    />
+                    <label htmlFor="mx" className="text-sm text-foreground cursor-pointer">
+                      <span className="font-medium">Registros MX</span> - Configuración del servidor de correo
+                    </label>
+                  </div>
+                  <div className="flex items-center space-x-2">
+                    <Checkbox
+                      id="subnet"
+                      checked={formData.subnet}
+                      onCheckedChange={(checked) => setValue('subnet', checked as boolean)}
+                    />
+                    <label htmlFor="subnet" className="text-sm text-foreground cursor-pointer">
+                      <span className="font-medium">Escaneo de Subred</span> - Análisis del rango de la red
+                    </label>
+                  </div>
+                  <div className="flex items-center space-x-2">
+                    <Checkbox
+                      id="ports"
+                      checked={formData.ports}
+                      onCheckedChange={(checked) => setValue('ports', checked as boolean)}
+                    />
+                    <label htmlFor="ports" className="text-sm text-foreground cursor-pointer">
+                      <span className="font-medium">Escaneo de Puertos</span> - Detección de puertos abiertos
+                    </label>
+                  </div>
+                  <div className="flex items-center space-x-2">
+                    <Checkbox
+                      id="subdomains"
+                      checked={formData.subdomains}
+                      onCheckedChange={(checked) => setValue('subdomains', checked as boolean)}
+                    />
+                    <label htmlFor="subdomains" className="text-sm text-foreground cursor-pointer">
+                      <span className="font-medium">Enumeración de Subdominios</span> - Buscar subdominios
+                    </label>
+                  </div>
+                  <div className="flex items-center space-x-2">
+                    <Checkbox
+                      id="reverseip"
+                      checked={formData.reverseip}
+                      onCheckedChange={(checked) => setValue('reverseip', checked as boolean)}
+                    />
+                    <label htmlFor="reverseip" className="text-sm text-foreground cursor-pointer">
+                      <span className="font-medium">Búsqueda Inversa de IP</span> - Sitios en el mismo servidor
+                    </label>
+                  </div>
+                </div>
+              </CardContent>
+            </Card>
+
+            {/* Vulnerability Scans */}
+            <Card className={cn(
+              "group relative overflow-hidden backdrop-blur-sm border-0 shadow-lg hover:shadow-2xl transition-all duration-500 hover:-translate-y-1",
+              anyVulnChecked 
+                ? "bg-gradient-to-br from-orange-500/10 via-red-500/15 to-orange-500/10" 
+                : "bg-gradient-to-br from-orange-500/5 via-red-500/10 to-orange-500/5"
+            )}>
+              <div className={cn(
+                "absolute inset-0 bg-gradient-to-br from-orange-500/10 to-transparent transition-opacity duration-500",
+                anyVulnChecked ? "opacity-100" : "opacity-0 group-hover:opacity-100"
+              )} />
+              <CardHeader className="flex flex-row items-center justify-between relative z-10">
+                <CardTitle className="flex items-center gap-3 text-slate-900 dark:text-slate-100">
+                  <div className="p-2 bg-orange-500/20 rounded-lg group-hover:scale-110 transition-transform duration-300">
+                    <AlertTriangle className="h-5 w-5 text-orange-600 dark:text-orange-400" />
+                  </div>
+                  <span className="font-semibold">Evaluación de Vulnerabilidades</span>
+                </CardTitle>
+                <Button type="button" variant="outline" size="sm" onClick={toggleVulnerabilityAssessment} className="bg-orange-50/50 dark:bg-orange-900/20 border-orange-200/50 dark:border-orange-700/30 text-orange-700 dark:text-orange-300 hover:bg-orange-100/70 dark:hover:bg-orange-800/30">
+                  {allVulnChecked ? <><Square className="h-4 w-4 mr-2" /> Deseleccionar Todo</> : <><CheckSquare className="h-4 w-4 mr-2" /> Seleccionar Todo</>}
+                </Button>
+              </CardHeader>
+              <CardContent className="relative z-10">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                  <div className="flex items-center space-x-2">
+                    <Checkbox
+                      id="sqlinjection"
+                      checked={formData.sqlinjection}
+                      onCheckedChange={(checked) => setValue('sqlinjection', checked as boolean)}
+                    />
+                    <label htmlFor="sqlinjection" className="text-sm text-foreground cursor-pointer">
+                      <span className="font-medium">Prueba de Inyección SQL</span> - Vulnerabilidad en la base de datos
+                    </label>
+                  </div>
+                  <div className="flex items-center space-x-2">
+                    <Checkbox
+                      id="xss"
+                      checked={formData.xss}
+                      onCheckedChange={(checked) => setValue('xss', checked as boolean)}
+                    />
+                    <label htmlFor="xss" className="text-sm text-foreground cursor-pointer">
+                      <span className="font-medium">Detección de XSS</span> - Prueba de cross-site scripting
+                    </label>
+                  </div>
+                  <div className="flex items-center space-x-2">
+                    <Checkbox
+                      id="lfi"
+                      checked={formData.lfi}
+                      onCheckedChange={(checked) => setValue('lfi', checked as boolean)}
+                    />
+                    <label htmlFor="lfi" className="text-sm text-foreground cursor-pointer">
+                      <span className="font-medium">Detección de LFI</span> - Prueba de inclusión de archivos locales
+                    </label>
+                  </div>
+                  <div className="flex items-center space-x-2">
+                    <Checkbox
+                      id="virustotal"
+                      checked={formData.virustotal}
+                      onCheckedChange={(checked) => setValue('virustotal', checked as boolean)}
+                    />
+                    <label htmlFor="virustotal" className="text-sm text-foreground cursor-pointer">
+                      <span className="font-medium">Escaneo VirusTotal</span> - Reputación y malware del dominio
+                    </label>
+                  </div>
+                  <div className="flex items-center space-x-2">
+                    <Checkbox
+                      id="corsMisconfig"
+                      checked={formData.corsMisconfig}
+                      onCheckedChange={(checked) => setValue('corsMisconfig', checked as boolean)}
+                    />
+                    <label htmlFor="corsMisconfig" className="text-sm text-foreground cursor-pointer">
+                      <span className="font-medium">Mala Configuración de CORS</span> - Cross-Origin Resource Sharing
+                    </label>
+                  </div>
+                </div>
+              </CardContent>
+            </Card>
+
+            {/* CMS Detection */}
+            <Card className={cn(
+              "group relative overflow-hidden backdrop-blur-sm border-0 shadow-lg hover:shadow-2xl transition-all duration-500 hover:-translate-y-1",
+              anyCmsChecked 
+                ? "bg-gradient-to-br from-indigo-500/10 via-blue-500/15 to-indigo-500/10" 
+                : "bg-gradient-to-br from-indigo-500/5 via-blue-500/10 to-indigo-500/5"
+            )}>
+              <div className={cn(
+                "absolute inset-0 bg-gradient-to-br from-indigo-500/10 to-transparent transition-opacity duration-500",
+                anyCmsChecked ? "opacity-100" : "opacity-0 group-hover:opacity-100"
+              )} />
+              <CardHeader className="flex flex-row items-center justify-between relative z-10">
+                <CardTitle className="flex items-center gap-3 text-slate-900 dark:text-slate-100">
+                  <div className="p-2 bg-indigo-500/20 rounded-lg group-hover:scale-110 transition-transform duration-300">
+                    <Code className="h-5 w-5 text-indigo-600 dark:text-indigo-400" />
+                  </div>
+                  <span className="font-semibold">CMS Detection</span>
+                </CardTitle>
+                <Button type="button" variant="outline" size="sm" onClick={toggleCmsDetection} className="bg-indigo-50/50 dark:bg-indigo-900/20 border-indigo-200/50 dark:border-indigo-700/30 text-indigo-700 dark:text-indigo-300 hover:bg-indigo-100/70 dark:hover:bg-indigo-800/30">
+                  {allCmsChecked ? <><Square className="h-4 w-4 mr-2" /> Deseleccionar Todo</> : <><CheckSquare className="h-4 w-4 mr-2" /> Seleccionar Todo</>}
+                </Button>
+              </CardHeader>
+              <CardContent className="relative z-10">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                  <div className="flex items-center space-x-2">
+                    <Checkbox
+                      id="wordpress"
+                      checked={formData.wordpress}
+                      onCheckedChange={(checked) => setValue('wordpress', checked as boolean)}
+                    />
+                    <label htmlFor="wordpress" className="text-sm text-foreground cursor-pointer">
+                      <span className="font-medium">Escaneo de WordPress</span> - Plugins, temas y versiones
+                    </label>
+                  </div>
+                </div>
+              </CardContent>
+            </Card>
+
+            {/* SEO & Analytics */}
+            <Card className={cn(
+              "group relative overflow-hidden backdrop-blur-sm border-0 shadow-lg hover:shadow-2xl transition-all duration-500 hover:-translate-y-1",
+              anySeoChecked 
+                ? "bg-gradient-to-br from-pink-500/10 via-rose-500/15 to-pink-500/10" 
+                : "bg-gradient-to-br from-pink-500/5 via-rose-500/10 to-pink-500/5"
+            )}>
+              <div className={cn(
+                "absolute inset-0 bg-gradient-to-br from-pink-500/10 to-transparent transition-opacity duration-500",
+                anySeoChecked ? "opacity-100" : "opacity-0 group-hover:opacity-100"
+              )} />
+              <CardHeader className="flex flex-row items-center justify-between relative z-10">
+                <CardTitle className="flex items-center gap-3 text-slate-900 dark:text-slate-100">
+                  <div className="p-2 bg-pink-500/20 rounded-lg group-hover:scale-110 transition-transform duration-300">
+                    <TrendingUp className="h-5 w-5 text-pink-600 dark:text-pink-400" />
+                  </div>
+                  <span className="font-semibold">SEO & Analytics</span>
+                </CardTitle>
+                <Button type="button" variant="outline" size="sm" onClick={toggleSeoAnalytics} className="bg-pink-50/50 dark:bg-pink-900/20 border-pink-200/50 dark:border-pink-700/30 text-pink-700 dark:text-pink-300 hover:bg-pink-100/70 dark:hover:bg-pink-800/30">
+                  {allSeoChecked ? <><Square className="h-4 w-4 mr-2" /> Deseleccionar Todo</> : <><CheckSquare className="h-4 w-4 mr-2" /> Seleccionar Todo</>}
+                </Button>
+              </CardHeader>
+              <CardContent className="relative z-10">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                  <div className="flex items-center space-x-2">
+                    <Checkbox
+                      id="seo"
+                      checked={formData.seo}
+                      onCheckedChange={(checked) => setValue('seo', checked as boolean)}
+                    />
+                    <label htmlFor="seo" className="text-sm text-foreground cursor-pointer">
+                      <span className="font-medium">Análisis SEO</span> - Meta tags, encabezados, enlaces
+                    </label>
+                  </div>
+                  <div className="flex items-center space-x-2">
+                    <Checkbox
+                      id="brokenLinks"
+                      checked={formData.brokenLinks}
+                      onCheckedChange={(checked) => setValue('brokenLinks', checked as boolean)}
+                    />
+                    <label htmlFor="brokenLinks" className="text-sm text-foreground cursor-pointer">
+                      <span className="font-medium">Detector de Enlaces Rotos</span> - Buscar enlaces internos/externos rotos
+                    </label>
+                  </div>
+                </div>
+              </CardContent>
+            </Card>
+
+            {/* Security Testing */}
+            <Card className={cn(
+              "group relative overflow-hidden backdrop-blur-sm border-0 shadow-lg hover:shadow-2xl transition-all duration-500 hover:-translate-y-1",
+              anySecurityChecked 
+                ? "bg-gradient-to-br from-purple-500/10 via-violet-500/15 to-purple-500/10" 
+                : "bg-gradient-to-br from-purple-500/5 via-violet-500/10 to-purple-500/5"
+            )}>
+              <div className={cn(
+                "absolute inset-0 bg-gradient-to-br from-purple-500/10 to-transparent transition-opacity duration-500",
+                anySecurityChecked ? "opacity-100" : "opacity-0 group-hover:opacity-100"
+              )} />
+              <CardHeader className="flex flex-row items-center justify-between relative z-10">
+                <CardTitle className="flex items-center gap-3 text-slate-900 dark:text-slate-100">
+                  <div className="p-2 bg-purple-500/20 rounded-lg group-hover:scale-110 transition-transform duration-300">
+                    <Zap className="h-5 w-5 text-purple-600 dark:text-purple-400" />
+                  </div>
+                  <span className="font-semibold">Security Testing</span>
+                </CardTitle>
+                <Button type="button" variant="outline" size="sm" onClick={toggleSecurityTesting} className="bg-purple-50/50 dark:bg-purple-900/20 border-purple-200/50 dark:border-purple-700/30 text-purple-700 dark:text-purple-300 hover:bg-purple-100/70 dark:hover:bg-purple-800/30">
+                  {allSecurityChecked ? <><Square className="h-4 w-4 mr-2" /> Deseleccionar Todo</> : <><CheckSquare className="h-4 w-4 mr-2" /> Seleccionar Todo</>}
+                </Button>
+              </CardHeader>
+              <CardContent className="relative z-10">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                  <div className="flex items-center space-x-2">
+                    <Checkbox
+                      id="ddosFirewall"
+                      checked={formData.ddosFirewall}
+                      onCheckedChange={(checked) => setValue('ddosFirewall', checked as boolean)}
+                    />
+                    <label htmlFor="ddosFirewall" className="text-sm text-foreground cursor-pointer">
+                      <span className="font-medium">Prueba DDoS Firewall</span> - Detectar protección WAF/DDoS
+                    </label>
+                  </div>
+                  <div className="flex items-center space-x-2">
+                    <Checkbox
+                      id="sslTls"
+                      checked={formData.sslTls}
+                      onCheckedChange={(checked) => setValue('sslTls', checked as boolean)}
+                    />
+                    <label htmlFor="sslTls" className="text-sm text-foreground cursor-pointer">
+                      <span className="font-medium">Análisis de SSL/TLS</span> - Detalles del certificado y caducidad
+                    </label>
+                  </div>
+                </div>
+              </CardContent>
+            </Card>
+
+            {/* Advanced Settings */}
+            <Card className="group relative overflow-hidden bg-gradient-to-br from-slate-500/5 via-slate-500/10 to-gray-500/5 backdrop-blur-sm border-0 shadow-lg hover:shadow-2xl transition-all duration-500 hover:-translate-y-1">
+              <div className="absolute inset-0 bg-gradient-to-br from-slate-500/10 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-500" />
+              <CardHeader className="relative z-10">
+                <CardTitle className="flex items-center gap-3 text-slate-900 dark:text-slate-100">
+                  <div className="p-2 bg-slate-500/20 rounded-lg group-hover:scale-110 transition-transform duration-300">
+                    <Settings2 className="h-5 w-5 text-slate-600 dark:text-slate-400" />
+                  </div>
+                  <span className="font-semibold">Advanced Settings</span>
+                </CardTitle>
+                <CardDescription className="text-slate-600 dark:text-slate-400 mt-2">
+                  Configuración del escaneo y opciones de rendimiento
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="relative z-10">
+                {formData.useProxy && (
+                  <Alert className="border-yellow-500/50 bg-yellow-500/10 mb-4">
+                    <AlertCircle className="h-4 w-4 text-yellow-600 dark:text-yellow-500" />
+                    <AlertTitle className="text-yellow-600 dark:text-yellow-400 font-bold">
+                       ADVERTENCIA: Riesgos de Proxy CORS Público
+                    </AlertTitle>
+                    <AlertDescription className="text-sm mt-2 text-yellow-600 dark:text-yellow-300">
+                        Has habilitado el uso del proxy. Esto enrutará el tráfico de tu escaneo a través de proxies CORS públicos.
+                        Ten en cuenta las implicaciones de privacidad y seguridad, ya que estos proxies pueden registrar tus solicitudes.
+                        Para operaciones sensibles, considera un proxy auto-hospedado.
+                    </AlertDescription>
+                  </Alert>
+                )}
+                <div className="space-y-4">
+                  <div className="flex items-center space-x-2">
+                    <Checkbox
+                      id="useProxy"
+                      checked={formData.useProxy}
+                      onCheckedChange={(checked) => setValue('useProxy', checked as boolean)}
+                    />
+                    <label htmlFor="useProxy" className="text-sm text-foreground cursor-pointer">
+                      <span className="font-medium">Usar Proxy</span> - Enrutar a través del servidor proxy
+                    </label>
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="threads">Hilos Concurrentes: {formData.threads} / 50</Label>
+                    <Input
+                      id="threads"
+                      type="range"
+                      min="1"
+                      max="50"
+                      value={formData.threads}
+                      onChange={(e) => setValue('threads', parseInt(e.target.value))}
+                      className="accent-primary"
+                    />
+                    <p className="text-xs text-muted-foreground flex items-center gap-1">
+                      <AlertTriangle className="h-3 w-3 text-yellow-600 dark:text-yellow-500" />
+                      Un mayor recuento de hilos puede degradar el rendimiento del navegador y activar límites de velocidad en los servidores objetivo.
+                    </p>
+                  </div>
+                </div>
+              </CardContent>
+            </Card>
+
+            {/* Submit Button */}
+            <div className="flex justify-end gap-4">
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => navigate('/')}
+                disabled={isScanning}
+                className="border-border text-foreground hover:bg-muted/50"
+              >
+                Cancelar
+              </Button>
+              <Button
+                type="submit"
+                disabled={isScanning}
+                className="bg-gradient-to-r from-blue-600 to-cyan-600 hover:from-blue-700 hover:to-cyan-700 shadow-lg shadow-primary/30 transition-all duration-300 hover:scale-[1.02] text-white font-semibold"
+              >
+                {isScanning ? (
+                  <>
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    {formData.scheduleScan ? 'Programando...' : 'Iniciando Escaneo...'}
+                  </>
+                ) : (
+                  <>
+                    {formData.scheduleScan ? <CalendarDays className="mr-2 h-4 w-4" /> : <Shield className="mr-2 h-4 w-4" />}
+                    {formData.scheduleScan ? 'Programar Escaneo' : 'Lanzar Escaneo'}
+                  </>
+                )}
+              </Button>
+            </div>
           </form>
-        </CardContent>
-      </Card>
+        </div>
+      </main>
     </div>
   );
 };
